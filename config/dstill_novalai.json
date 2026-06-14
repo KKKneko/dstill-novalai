@@ -1,0 +1,39 @@
+{
+  "network": {
+    "proxy": "127.0.0.1:7890"
+  },
+  "agent": {
+    "api_format": "",
+    "base_url": "",
+    "model": "",
+    "api_key_env": "",
+    "timeout_seconds": 60,
+    "max_retries": 3,
+    "temperature": 0.2,
+    "cache_enabled": true,
+    "cache_dir": ""
+  },
+  "prompt": {
+    "exclude_tags": [
+      "monochrome",
+      "greyscale",
+      "sepia",
+      "spot color",
+      "partially colored",
+      "limited palette",
+      "sketch",
+      "lineart",
+      "no lineart",
+      "flat color",
+      "unfinished",
+      "outline",
+      "color trace",
+      "traditional media",
+      "halftone",
+      "comic",
+      "4koma",
+      "silhouette",
+      "chibi"
+    ]
+  }
+}

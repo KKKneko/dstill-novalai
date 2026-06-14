@@ -1,0 +1,64 @@
+/* 暗房·胶片暖调 —— 深炭底(非纯黑) + 琥珀光强调。
+   色阶按 color-theory 思路：同色相低明度炭灰做底，暖白文字，单一琥珀强调。 */
+:root {
+  --bg-0: #0e0c09; /* 最深暖炭，非纯黑 */
+  --bg-1: #16120d;
+  --bg-2: #201913;
+  --bg-3: #2b2118;
+  --line: #34281c;
+  --ink: #f1e8d7; /* 暖白主文字 */
+  --ink-2: #c9bba2;
+  --ink-dim: #94866f; /* 次要/弱化 */
+  --amber: #e9a33c; /* 琥珀强调 */
+  --amber-2: #f2c074;
+  --amber-glow: rgba(233, 163, 60, 0.35);
+  --danger: #cf5630;
+  --ok: #9bab5c;
+  --shadow: rgba(0, 0, 0, 0.6);
+
+  --font: 'Inter', 'Segoe UI', system-ui, -apple-system, 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  --mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, 'SFMono-Regular',
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg-0);
+  color: var(--ink);
+  font-family: var(--font);
+  overflow: hidden;
+}
+
+#app {
+  height: 100vh;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+::selection {
+  background: var(--amber-glow);
+}
+
+/* 暗房灯箱：中心微聚光、四周压暗，靠光影而非边框分区 */
+.darkroom-bg {
+  background:
+    radial-gradient(120% 90% at 50% 38%, var(--bg-2) 0%, var(--bg-1) 42%, var(--bg-0) 100%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.06s !important;
+  }
+}

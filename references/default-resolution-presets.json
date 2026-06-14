@@ -1,0 +1,90 @@
+[
+  {
+    "name": "square_1024x1024",
+    "width": 1024,
+    "height": 1024,
+    "orientation": "square"
+  },
+  {
+    "name": "square_896x896",
+    "width": 896,
+    "height": 896,
+    "orientation": "square"
+  },
+  {
+    "name": "portrait_default_832x1216",
+    "width": 832,
+    "height": 1216,
+    "orientation": "portrait",
+    "default_for": "single"
+  },
+  {
+    "name": "portrait_768x1152",
+    "width": 768,
+    "height": 1152,
+    "orientation": "portrait"
+  },
+  {
+    "name": "portrait_896x1152",
+    "width": 896,
+    "height": 1152,
+    "orientation": "portrait"
+  },
+  {
+    "name": "tall_portrait_704x1472",
+    "width": 704,
+    "height": 1472,
+    "orientation": "portrait"
+  },
+  {
+    "name": "tall_portrait_640x1536",
+    "width": 640,
+    "height": 1536,
+    "orientation": "portrait"
+  },
+  {
+    "name": "landscape_default_1216x832",
+    "width": 1216,
+    "height": 832,
+    "orientation": "landscape",
+    "default_for": "landscape"
+  },
+  {
+    "name": "landscape_1152x896",
+    "width": 1152,
+    "height": 896,
+    "orientation": "landscape"
+  },
+  {
+    "name": "landscape_1344x768",
+    "width": 1344,
+    "height": 768,
+    "orientation": "landscape"
+  },
+  {
+    "name": "wide_landscape_1472x704",
+    "width": 1472,
+    "height": 704,
+    "orientation": "landscape"
+  },
+  {
+    "name": "cinematic_1536x640",
+    "width": 1536,
+    "height": 640,
+    "orientation": "landscape"
+  },
+  {
+    "name": "multi_landscape_1024x768",
+    "width": 1024,
+    "height": 768,
+    "orientation": "landscape",
+    "default_for": "multi"
+  },
+  {
+    "name": "multi_portrait_768x1024",
+    "width": 768,
+    "height": 1024,
+    "orientation": "portrait",
+    "default_for": "multi_portrait"
+  }
+]
