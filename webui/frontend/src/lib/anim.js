@@ -2,9 +2,8 @@
 // GSAP 3.13 起 Flip / SplitText / Physics2DPlugin 已并入主 npm 包，免费可用。
 import { gsap } from 'gsap';
 import { Physics2DPlugin } from 'gsap/Physics2DPlugin';
-import { SplitText } from 'gsap/SplitText';
 
-gsap.registerPlugin(Physics2DPlugin, SplitText);
+gsap.registerPlugin(Physics2DPlugin);
 
 export const reduced = () =>
   typeof window !== 'undefined' &&
@@ -67,23 +66,20 @@ export function dissolveImage(el, { instant = false } = {}) {
   gsap.to(el, { ...DISSOLVED, duration: 0.55, ease: 'power2.in' });
 }
 
-// HUD 提示词逐词浮现。
+// HUD 提示词浮现。整体淡入 + 微上浮 + 去模糊；不切词、不改 DOM 结构，
+// 以免破坏 Svelte 对该节点文本的响应式绑定（曾导致切图后提示词卡住不更新）。
 export function revealText(el) {
   if (!el) return;
+  gsap.killTweensOf(el);
   if (reduced()) {
     gsap.fromTo(el, { opacity: 0 }, { opacity: 1, duration: 0.12 });
     return;
   }
-  const split = new SplitText(el, { type: 'words' });
-  gsap.from(split.words, {
-    opacity: 0,
-    y: 10,
-    filter: 'blur(4px)',
-    duration: 0.5,
-    stagger: 0.012,
-    ease: 'power2.out',
-    onComplete: () => split.revert(),
-  });
+  gsap.fromTo(
+    el,
+    { opacity: 0, y: 8, filter: 'blur(5px)' },
+    { opacity: 1, y: 0, filter: 'blur(0px)', duration: 0.5, ease: 'power2.out', clearProps: 'filter' },
+  );
 }
 
 // 胶片流新缩略入场。

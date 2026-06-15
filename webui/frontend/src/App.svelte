@@ -13,17 +13,32 @@
   let toast = $state('');
   let queue = $state([]); // 待审 artifacts（list_artifacts 项）
   let index = $state(0);
-  let progress = $state({ total: 0, generated: 0, skipped: 0, resumed: 0, done: false });
+  let progress = $state({ total: 0, generated: 0, skipped: 0, resumed: 0, done: false, error: null });
   // 当前正在处理的 entry（agent / NAI 这种长调用没有自己的事件，靠这个让 UI 不像死掉）
   let inflight = $state(null);
 
-  const current = $derived(queue[index] ?? null);
+  // 续跑「本次会话新出图」专属队列：仅当本次开跑携带 resumable_done 时激活。
+  // 主胶片流照旧按 list_artifacts 字母序展示全部产物，这条窄队列按时间序只装这次跑出的新图，
+  // 方便和「原本就在那」的图分开审。生命周期：job_start(resumable_done>0) 激活并清空，
+  // job_complete 不清——审到下一次开跑前一直留着；下次 job_start 再次清空。
+  let resumeActive = $state(false);
+  let resumeStems = $state([]); // FIFO，按 image_saved 到达顺序
+  let resumeIndex = $state(0);
+  // 焦点队列：'main' = 主胶片流，'resume' = 续跑队列。Tab 切焦点。
+  let focusZone = $state('main');
   // 重跑队列：可多张排队，串行处理（NovelAI 单 token 同时只允许一个在途请求，故无并发收益）。
   // 视觉按 artifact 绑定——被排队/重跑的图显示溶解态 +「排队中 / 重跑中」浮层，
   // 切到别的图自然不显示、切回来仍是溶解态（而非命令式涂在屏幕上）。
   let rerunQueue = $state([]); // 等待重跑的 artifact_stem（FIFO，尚未开始）
   let rerunActive = $state(null); // 正在重跑的 artifact_stem
   let rerunBusy = false; // worker 循环是否在跑（纯控制流，非响应式）
+  // 续跑队列里的项 = 主 queue 里同 stem 的项；不存两份，删图后主 queue 没了→续跑队列里自动消失。
+  const resumeQueue = $derived(
+    resumeStems.map((s) => queue.find((a) => a.artifact_stem === s)).filter(Boolean),
+  );
+  const current = $derived(
+    focusZone === 'resume' ? (resumeQueue[resumeIndex] ?? null) : (queue[index] ?? null),
+  );
   const isStemRerunning = (stem) => !!stem && (stem === rerunActive || rerunQueue.includes(stem));
   const currentRerunState = $derived(
     !current
@@ -52,8 +67,17 @@
     model: 'nai-diffusion-4-5-full',
     resolution_preset: 'portrait_default_832x1216',
     positive_prefix_mode: 'none',
+    positive_prefix: '', // 自定义正面前缀（positive_prefix_mode=custom 时生效）
     negative_prompt_mode: 'preset',
     negative_uc_preset: 3,
+    negative_prompt: '', // 自定义负面词（negative_prompt_mode=custom 时生效）
+    sampler: 'k_euler',
+    steps: 28,
+    scale: 5.0,
+    cfg_rescale: null, // 留空保持 Web 默认
+    noise_schedule: '', // 留空保持 Web 默认
+    seed: null, // 留空随机
+    n_samples: 1,
     agent_api_format: 'openai',
     agent_base_url: '',
     agent_model: 'gemini-3.1-pro-preview',
@@ -62,6 +86,156 @@
     novelai_token: '', // NovelAI token：留空则读环境变量 NOVELAI_TOKEN
     dry_run: false,
   });
+
+  // 下拉枚举（model/sampler/分辨率/uc）来自后端 GET /options；拉取失败时这里的兜底保证表单仍可用。
+  let options = $state({
+    models: ['nai-diffusion-4-5-full'],
+    samplers: ['k_euler'],
+    resolution_presets: ['portrait_default_832x1216'],
+    uc_presets: [1, 2, 3],
+  });
+
+  // 发起参数预设：存后端 config/presets/*.json（密钥永不入预设）。
+  let presetList = $state([]);
+  let selectedPreset = $state('');
+  let presetName = $state('');
+
+  async function refreshPresets() {
+    try {
+      presetList = await api.presets();
+    } catch {
+      /* 端点不可用时忽略 */
+    }
+  }
+
+  async function loadPreset() {
+    if (!selectedPreset) return;
+    try {
+      const data = await api.getPreset(selectedPreset);
+      form = { ...form, ...data }; // 预设不含密钥 → 当前已填的密钥保持不动
+      presetName = selectedPreset;
+      flash(`已载入预设「${selectedPreset}」`);
+    } catch (e) {
+      flash('载入预设失败：' + e.message);
+    }
+  }
+
+  async function savePreset() {
+    const name = presetName.trim();
+    if (!name) return;
+    const payload = {};
+    for (const [k, v] of Object.entries(form)) {
+      if (k === 'agent_api_key' || k === 'novelai_token') continue; // 绝不存密钥
+      payload[k] = v;
+    }
+    try {
+      const res = await api.savePreset(name, payload);
+      await refreshPresets();
+      selectedPreset = res?.name ?? name;
+      flash(`已保存预设「${selectedPreset}」`);
+    } catch (e) {
+      flash('保存预设失败：' + e.message);
+    }
+  }
+
+  async function deletePreset() {
+    if (!selectedPreset) return;
+    try {
+      await api.deletePreset(selectedPreset);
+      selectedPreset = '';
+      await refreshPresets();
+      flash('已删除预设');
+    } catch (e) {
+      flash('删除预设失败：' + e.message);
+    }
+  }
+
+  // 大图滚轮缩放 + 左键拖拽平移：作用在包裹层 .zoom-layer 上，与 GSAP 动画（动 <img> 的
+  // transform）各管一层、嵌套互不冲突。切图时（resetKey 变）自动复位，双击亦复位。
+  function panzoom(node, params = {}) {
+    let scale = 1;
+    let x = 0;
+    let y = 0;
+    let dragging = false;
+    let sx = 0;
+    let sy = 0;
+    let key = params.resetKey;
+    const apply = () => {
+      node.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+      node.style.cursor = scale > 1 ? (dragging ? 'grabbing' : 'grab') : 'default';
+    };
+    const reset = () => {
+      scale = 1;
+      x = 0;
+      y = 0;
+      dragging = false;
+      apply();
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      const rect = node.getBoundingClientRect();
+      const cx = e.clientX - (rect.left + rect.width / 2);
+      const cy = e.clientY - (rect.top + rect.height / 2);
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const ns = Math.min(8, Math.max(1, scale * factor));
+      const k = ns / scale;
+      x = cx - k * (cx - x);
+      y = cy - k * (cy - y);
+      scale = ns;
+      if (scale <= 1.0001) {
+        scale = 1;
+        x = 0;
+        y = 0;
+      }
+      apply();
+    };
+    const onDown = (e) => {
+      if (e.button !== 0 || scale <= 1) return;
+      dragging = true;
+      sx = e.clientX - x;
+      sy = e.clientY - y;
+      node.setPointerCapture(e.pointerId);
+      apply();
+    };
+    const onMove = (e) => {
+      if (!dragging) return;
+      x = e.clientX - sx;
+      y = e.clientY - sy;
+      apply();
+    };
+    const onUp = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      try {
+        node.releasePointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      apply();
+    };
+    const onDbl = () => reset();
+    node.addEventListener('wheel', onWheel, { passive: false });
+    node.addEventListener('pointerdown', onDown);
+    node.addEventListener('pointermove', onMove);
+    node.addEventListener('pointerup', onUp);
+    node.addEventListener('dblclick', onDbl);
+    apply();
+    return {
+      update(p = {}) {
+        if (p.resetKey !== key) {
+          key = p.resetKey;
+          reset();
+        }
+      },
+      destroy() {
+        node.removeEventListener('wheel', onWheel);
+        node.removeEventListener('pointerdown', onDown);
+        node.removeEventListener('pointermove', onMove);
+        node.removeEventListener('pointerup', onUp);
+        node.removeEventListener('dblclick', onDbl);
+      },
+    };
+  }
 
   function flash(message) {
     toast = message;
@@ -111,9 +285,21 @@
         skipped: 0,
         resumed: 0,
         done: false,
+        error: null,
       };
       inflight = null;
-      if (ev.resumable_done) flash(`续跑：${ev.resumable_done} 条已完成会被跳过`);
+      // 续跑专属窄队列：仅当后端报告有「续跑已跳过」的 entry 时激活，并清空上次会话的暂存。
+      if (ev.resumable_done) {
+        flash(`续跑：${ev.resumable_done} 条已完成会被跳过`);
+        resumeActive = true;
+        resumeStems = [];
+        resumeIndex = 0;
+      } else {
+        resumeActive = false;
+        resumeStems = [];
+        resumeIndex = 0;
+        focusZone = 'main';
+      }
     } else if (ev.type === 'entry_started') {
       const where = ev.source_line_number != null ? `第 ${ev.source_line_number} 行` : `#${ev.source_prompt_index ?? '?'}`;
       inflight = { where, multichar: !!ev.multichar };
@@ -122,7 +308,13 @@
       inflight = null;
       const stem = ev.image_index ? `${ev.output_stem}_${ev.image_index + 1}` : ev.output_stem;
       try {
-        pushArtifact(await api.detail(stem));
+        const meta = await api.detail(stem);
+        pushArtifact(meta);
+        // 续跑期间新出的图（非用户手动 R 重跑的产物）入续跑队列。
+        // 判定：image_saved 事件来时这个 stem 不在 rerunActive/rerunQueue 里 → 视为续跑产物。
+        if (resumeActive && !isStemRerunning(stem) && !resumeStems.includes(stem)) {
+          resumeStems = [...resumeStems, stem];
+        }
       } catch {
         /* metadata not ready yet */
       }
@@ -140,8 +332,13 @@
       const reason = ev.reason || '未知原因';
       flash(`跳过 ${where} · ${phase}/${reason}`);
     } else if (ev.type === 'job_error') {
-      flash('批量出错：' + (ev.message || ''));
+      // worker 早期 raise（路径错、config 损坏、token 失效等）会走这条；done=true 让主区跳出
+      // 「等待出图…」并显示醒目错误条；error 文案给用户实质线索而非空 toast。
+      const code = ev.code === 'token_missing' ? 'NovelAI token 无效或缺失' : null;
+      const message = code || ev.message || '批量任务异常中止';
+      progress = { ...progress, done: true, error: message };
       inflight = null;
+      flash('批量出错：' + message);
     }
   }
 
@@ -159,9 +356,40 @@
       if (i >= 0) index = i;
     }
     if (index > queue.length - 1) index = Math.max(0, queue.length - 1);
+    // 续跑队列项 = 主 queue 里同 stem 的项；删图后 .find 会自动滤掉，但 resumeIndex 可能越界。
+    if (resumeIndex > resumeQueue.length - 1) resumeIndex = Math.max(0, resumeQueue.length - 1);
+    if (focusZone === 'resume' && resumeQueue.length === 0) focusZone = 'main';
   }
 
   async function start() {
+    // 提交前拦截非法组合：这些校验后端在 worker 线程里才报（走 job_error SSE），
+    // 不拦的话用户开跑后才看到错，体验差。
+    if (form.positive_prefix_mode === 'custom' && !String(form.positive_prefix).trim()) {
+      flash('正面前缀：自定义模式需填内容');
+      return;
+    }
+    if (form.negative_prompt_mode === 'preset' && ![1, 2, 3].includes(form.negative_uc_preset)) {
+      flash('负面词：UC 预设需选 1 / 2 / 3');
+      return;
+    }
+    if (form.negative_prompt_mode === 'custom' && !String(form.negative_prompt).trim()) {
+      flash('负面词：自定义模式需填内容');
+      return;
+    }
+    // mode 始终是 auto-multichar / all-agent，kernel 的 resolve_agent_runtime_config 都会被调到，
+    // 所以 base_url / model 必填——空了内核会抛 ValueError、走 worker 线程的 job_error SSE，
+    // 用户只看到 toast 闪一下、页面卡在「等待出图…」，故在此直接拦下。
+    if (['auto-multichar', 'all-agent'].includes(form.mode)) {
+      if (!String(form.agent_base_url).trim()) {
+        flash('agent base_url 不能为空（载入预设或手动填一个 LLM relay 地址）');
+        return;
+      }
+      if (!String(form.agent_model).trim()) {
+        flash('agent model 不能为空');
+        return;
+      }
+    }
+
     const body = {};
     for (const [k, v] of Object.entries(form)) {
       if (v === '' || v == null) continue;
@@ -169,6 +397,10 @@
     }
     if (body.prompt_file) delete body.prompt_dir;
     else if (body.prompt_dir) delete body.prompt_file;
+    // 清理与所选模式无关的字段（后端虽会忽略，但保持请求体干净，避免误读）
+    if (form.positive_prefix_mode !== 'custom') delete body.positive_prefix;
+    if (form.negative_prompt_mode !== 'preset') delete body.negative_uc_preset;
+    if (form.negative_prompt_mode !== 'custom') delete body.negative_prompt;
     busy = true;
     try {
       await api.run(body);
@@ -183,13 +415,26 @@
   }
 
   function selectIndex(i) {
+    focusZone = 'main';
     index = i;
   }
+  function selectResume(i) {
+    focusZone = 'resume';
+    resumeIndex = i;
+  }
+  function toggleFocus() {
+    if (!resumeActive || resumeQueue.length === 0) return;
+    focusZone = focusZone === 'main' ? 'resume' : 'main';
+  }
   function next() {
-    if (index < queue.length - 1) index++;
+    if (focusZone === 'resume') {
+      if (resumeIndex < resumeQueue.length - 1) resumeIndex++;
+    } else if (index < queue.length - 1) index++;
   }
   function prev() {
-    if (index > 0) index--;
+    if (focusZone === 'resume') {
+      if (resumeIndex > 0) resumeIndex--;
+    } else if (index > 0) index--;
   }
 
   async function approveNext() {
@@ -202,7 +447,10 @@
       flash('标记失败：' + e.message);
     }
     playApprove(stageImgEl, () => {
-      if (index < queue.length - 1) index++;
+      if (focusZone === 'resume') {
+        if (resumeIndex < resumeQueue.length - 1) resumeIndex++;
+        else flash('续跑队列已是最后一张');
+      } else if (index < queue.length - 1) index++;
       else flash('已是最后一张');
     });
   }
@@ -266,6 +514,8 @@
     }
     if (i >= 0) index = i;
     else if (index > queue.length - 1) index = Math.max(0, queue.length - 1);
+    if (resumeIndex > resumeQueue.length - 1) resumeIndex = Math.max(0, resumeQueue.length - 1);
+    if (focusZone === 'resume' && resumeQueue.length === 0) focusZone = 'main';
   }
 
   function del() {
@@ -330,11 +580,27 @@
       startEdit();
     } else if (e.key === 'ArrowRight') next();
     else if (e.key === 'ArrowLeft') prev();
+    else if (e.key === 'Tab') {
+      // Tab：在主胶片流和续跑队列之间切焦点。仅续跑队列存在且非空时有切换意义。
+      if (resumeActive && resumeQueue.length > 0) {
+        e.preventDefault();
+        toggleFocus();
+      }
+    }
   }
 
   onMount(() => {
     const handler = (e) => onKey(e);
     window.addEventListener('keydown', handler);
+    api
+      .options()
+      .then((o) => {
+        options = o;
+      })
+      .catch(() => {
+        /* 端点不可用时用兜底默认值，表单仍可工作 */
+      });
+    refreshPresets();
     return () => {
       window.removeEventListener('keydown', handler);
       es && es.close();
@@ -349,6 +615,17 @@
       <h1>暗房 · 审片台</h1>
       <p class="sub">装入一卷 prompt，开始边出图边审。</p>
 
+      <div class="presets">
+        <select bind:value={selectedPreset} onchange={loadPreset} title="载入已存预设">
+          <option value="">— 载入预设 —</option>
+          {#each presetList as p}<option value={p}>{p}</option>{/each}
+        </select>
+        <input class="preset-name" bind:value={presetName} placeholder="预设名" />
+        <button class="ghost" type="button" onclick={savePreset} disabled={!presetName.trim()}>存为预设</button>
+        {#if selectedPreset}<button class="ghost danger" type="button" onclick={deletePreset}>删除</button>{/if}
+      </div>
+      <p class="hint-sm">预设存服务端 config/presets/*.json，复用上次参数；两个密钥不会写入预设。</p>
+
       <label>单文件 .txt（多行=多条）<input bind:value={form.prompt_file} placeholder="绝对路径，留空则用目录" /></label>
       <label>或 目录<input bind:value={form.prompt_dir} placeholder="绝对路径目录" /></label>
       <div class="row">
@@ -357,9 +634,41 @@
       </div>
       <label>输出目录<input bind:value={form.output_dir} placeholder="留空自动 output/run_时间戳" /></label>
       <div class="row">
-        <label>分辨率<input bind:value={form.resolution_preset} /></label>
+        <label>使用模型<select bind:value={form.model}>{#each options.models as m}<option value={m}>{m}</option>{/each}</select></label>
         <label>模式<select bind:value={form.mode}><option value="auto-multichar">auto-multichar</option><option value="all-agent">all-agent</option></select></label>
       </div>
+      <div class="row">
+        <label>分辨率<select bind:value={form.resolution_preset}><option value="">自动（留空）</option>{#each options.resolution_presets as r}<option value={r}>{r}</option>{/each}</select></label>
+        <label>正面前缀<select bind:value={form.positive_prefix_mode}><option value="none">不加</option><option value="preset">预设质量词</option><option value="custom">自定义</option></select></label>
+      </div>
+      {#if form.positive_prefix_mode === 'custom'}
+        <label>正面前缀内容<textarea rows="2" bind:value={form.positive_prefix} placeholder="逗号分隔 tag，前置到每条 prompt"></textarea></label>
+      {/if}
+      <div class="row">
+        <label>负面词<select bind:value={form.negative_prompt_mode}><option value="none">不加</option><option value="preset">UC 预设</option><option value="custom">自定义</option></select></label>
+        {#if form.negative_prompt_mode === 'preset'}
+          <label>UC 预设<select bind:value={form.negative_uc_preset}>{#each options.uc_presets as u}<option value={u}>UC {u}</option>{/each}</select></label>
+        {/if}
+      </div>
+      {#if form.negative_prompt_mode === 'custom'}
+        <label>负面词内容<textarea rows="2" bind:value={form.negative_prompt} placeholder="逗号分隔的负面 tag"></textarea></label>
+      {/if}
+      <details class="adv">
+        <summary>高级 · 采样参数</summary>
+        <div class="row">
+          <label>采样器<select bind:value={form.sampler}>{#each options.samplers as s}<option value={s}>{s}</option>{/each}</select></label>
+          <label>步数 steps<input type="number" min="1" bind:value={form.steps} /></label>
+        </div>
+        <div class="row">
+          <label>引导 scale<input type="number" min="0" step="0.1" bind:value={form.scale} /></label>
+          <label>cfg_rescale<input type="number" min="0" step="0.1" bind:value={form.cfg_rescale} placeholder="留空用默认" /></label>
+        </div>
+        <div class="row">
+          <label>noise_schedule<input bind:value={form.noise_schedule} placeholder="留空用默认" /></label>
+          <label>每条张数 n_samples<input type="number" min="1" max="4" bind:value={form.n_samples} /></label>
+        </div>
+        <label>种子 seed<input type="number" bind:value={form.seed} placeholder="留空随机" /></label>
+      </details>
       <div class="row">
         <label>agent base_url<input bind:value={form.agent_base_url} placeholder="https://…" /></label>
         <label>agent model<input bind:value={form.agent_model} placeholder="如 c46" /></label>
@@ -381,9 +690,17 @@
     <!-- 中央：当前审查大图 -->
     <section class="stage">
       {#if current}
-        {#key current.artifact_stem + (current.sha256 || '')}
-          <img class="stage-img" use:enterAction src={imgSrc(current)} alt="" />
-        {/key}
+        <div class="zoom-layer" use:panzoom={{ resetKey: current.artifact_stem }}>
+          {#key current.artifact_stem + (current.sha256 || '')}
+            <img class="stage-img" use:enterAction src={imgSrc(current)} alt="" draggable="false" />
+          {/key}
+        </div>
+      {:else if progress.error}
+        <div class="empty error-state" role="alert">
+          <div class="error-title">⚠ 批量任务异常中止</div>
+          <div class="error-detail">{progress.error}</div>
+          <div class="error-hint">查看后端日志获取完整堆栈；修正后刷新页面重发起。</div>
+        </div>
       {:else}
         <div class="empty">{progress.done ? '没有可审的图' : '等待出图…'}</div>
       {/if}
@@ -444,16 +761,41 @@
 
       <!-- 键位提示 -->
       <div class="keyhint">
-        <kbd>空格</kbd>通过 <kbd>R</kbd>重跑 <kbd>X</kbd>删 <kbd>E</kbd>改词 <kbd>←→</kbd>切换
+        <kbd>空格</kbd>通过 <kbd>R</kbd>重跑 <kbd>X</kbd>删 <kbd>E</kbd>改词 <kbd>←→</kbd>切换{#if resumeActive} <kbd>Tab</kbd>切焦点{/if} <kbd>滚轮</kbd>缩放 <kbd>拖拽</kbd>平移 <kbd>双击</kbd>复位
       </div>
     </section>
 
+    <!-- 续跑专属胶片流：仅本次会话续跑期间出现，保留到下次开跑前。 -->
+    {#if resumeActive}
+      <footer class="filmstrip resume-strip" class:focused={focusZone === 'resume'}>
+        <div class="strip-tag">⟲ 本次续跑 · {resumeQueue.length}</div>
+        {#each resumeQueue as art, i (art.artifact_stem)}
+          <button
+            class="thumb"
+            class:active={focusZone === 'resume' && i === resumeIndex}
+            class:approved={art.review_status === 'approved'}
+            class:rerunning={isStemRerunning(art.artifact_stem)}
+            use:filmAction
+            onclick={() => selectResume(i)}
+            title={art.raw_tags}
+          >
+            <img src={imgSrc(art)} alt="" />
+            <span class="num">{i + 1}</span>
+            {#if isStemRerunning(art.artifact_stem)}<span class="thumb-reforge">⟳</span>{/if}
+          </button>
+        {/each}
+        {#if resumeQueue.length === 0}
+          <div class="film-empty">续跑队列空 · 新出图将在此排队</div>
+        {/if}
+      </footer>
+    {/if}
+
     <!-- 底部胶片流 -->
-    <footer class="filmstrip">
+    <footer class="filmstrip" class:focused={focusZone === 'main'}>
       {#each queue as art, i (art.artifact_stem)}
         <button
           class="thumb"
-          class:active={i === index}
+          class:active={focusZone === 'main' && i === index}
           class:approved={art.review_status === 'approved'}
           class:rerunning={isStemRerunning(art.artifact_stem)}
           use:filmAction
@@ -484,6 +826,8 @@
   }
   .panel {
     width: min(560px, 92vw);
+    max-height: 92vh;
+    overflow-y: auto;
     padding: 38px 40px;
     background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
     box-shadow: 0 40px 120px var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.03);
@@ -514,7 +858,8 @@
     flex: 1;
   }
   .panel input,
-  .panel select {
+  .panel select,
+  .panel textarea {
     display: block;
     width: 100%;
     margin-top: 5px;
@@ -527,9 +872,40 @@
     outline: none;
     transition: border-color 0.2s;
   }
+  .panel textarea {
+    resize: vertical;
+    min-height: 48px;
+    font-family: var(--mono);
+    line-height: 1.5;
+  }
   .panel input:focus,
-  .panel select:focus {
+  .panel select:focus,
+  .panel textarea:focus {
     border-color: var(--amber);
+  }
+  .panel details.adv {
+    margin: 16px 0 4px;
+    border-top: 1px solid var(--line);
+    padding-top: 6px;
+  }
+  .panel details.adv > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 0;
+    font-size: 12px;
+    color: var(--ink-dim);
+    letter-spacing: 0.08em;
+    user-select: none;
+  }
+  .panel details.adv > summary::-webkit-details-marker {
+    display: none;
+  }
+  .panel details.adv > summary::before {
+    content: '▸ ';
+    color: var(--amber);
+  }
+  .panel details.adv[open] > summary::before {
+    content: '▾ ';
   }
   .panel .chk {
     display: flex;
@@ -568,6 +944,49 @@
     font-size: 11px;
   }
 
+  .presets {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 14px 0 2px;
+  }
+  .presets select,
+  .presets input {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    margin-top: 0;
+  }
+  .presets .preset-name {
+    flex: 0 1 110px;
+  }
+  .presets button {
+    flex: 0 0 auto;
+    padding: 6px 12px;
+    background: transparent;
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    font-size: 12px;
+    cursor: pointer;
+    transition:
+      border-color 0.2s,
+      color 0.2s;
+  }
+  .presets button:hover:not(:disabled) {
+    border-color: var(--amber);
+    color: var(--ink);
+  }
+  .presets button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .presets button.danger:hover {
+    border-color: #c0584e;
+    color: #e58b82;
+  }
+
   .app {
     height: 100vh;
     display: grid;
@@ -578,6 +997,14 @@
     overflow: hidden;
     display: grid;
     place-items: center;
+  }
+  .zoom-layer {
+    display: grid;
+    place-items: center;
+    transform-origin: center center;
+    will-change: transform;
+    touch-action: none;
+    user-select: none;
   }
   .stage-img {
     max-height: 72vh;
@@ -632,6 +1059,36 @@
     color: var(--ink-dim);
     font-size: 14px;
     letter-spacing: 0.1em;
+  }
+  .error-state {
+    max-width: 560px;
+    padding: 22px 28px;
+    border: 1px solid #b1452f;
+    background: linear-gradient(180deg, rgba(120, 30, 14, 0.22), rgba(60, 12, 6, 0.32));
+    box-shadow: 0 0 32px rgba(178, 70, 47, 0.35), inset 0 1px 0 rgba(255, 200, 170, 0.06);
+    color: #f3d2c4;
+    letter-spacing: 0.04em;
+    text-align: left;
+  }
+  .error-state .error-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #ff9b7a;
+    letter-spacing: 0.12em;
+    margin-bottom: 10px;
+  }
+  .error-state .error-detail {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    color: #f3d2c4;
+    word-break: break-word;
+    margin-bottom: 10px;
+  }
+  .error-state .error-hint {
+    font-size: 12px;
+    color: var(--ink-dim);
+    letter-spacing: 0.06em;
   }
 
   .hud {
@@ -772,6 +1229,32 @@
     background: linear-gradient(180deg, transparent, var(--bg-0) 60%);
     border-top: 1px solid var(--line);
     box-shadow: inset 0 30px 50px -30px rgba(0, 0, 0, 0.9);
+  }
+  .filmstrip.focused {
+    /* 焦点队列的指示：顶部一条细琥珀线，不抢眼但能让用户秒辨 ←/→ 在哪条里走 */
+    border-top-color: var(--amber-2);
+    box-shadow:
+      inset 0 1px 0 var(--amber-glow),
+      inset 0 30px 50px -30px rgba(0, 0, 0, 0.9);
+  }
+  .filmstrip.resume-strip {
+    height: 108px;
+    background: linear-gradient(180deg, rgba(60, 36, 12, 0.18), var(--bg-0) 80%);
+  }
+  .filmstrip.resume-strip .thumb {
+    height: 86px;
+  }
+  .strip-tag {
+    flex: 0 0 auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--amber-2);
+    padding: 4px 10px;
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    background: rgba(0, 0, 0, 0.3);
+    align-self: center;
   }
   .thumb {
     position: relative;

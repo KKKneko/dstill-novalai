@@ -26,6 +26,11 @@ const enc = encodeURIComponent;
 
 export const api = {
   health: () => request('GET', '/health'),
+  options: () => request('GET', '/options'),
+  presets: () => request('GET', '/presets'),
+  getPreset: (name) => request('GET', `/presets/${enc(name)}`),
+  savePreset: (name, params) => request('PUT', `/presets/${enc(name)}`, params),
+  deletePreset: (name) => request('DELETE', `/presets/${enc(name)}`),
   run: (params) => request('POST', '/run', params),
   listArtifacts: () => request('GET', '/artifacts'),
   detail: (stem) => request('GET', `/artifacts/${enc(stem)}`),

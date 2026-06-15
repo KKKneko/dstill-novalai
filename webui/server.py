@@ -18,6 +18,7 @@ import dataclasses
 import json
 import os
 import queue
+import re
 import sys
 import threading
 from pathlib import Path
@@ -36,6 +37,23 @@ from fastapi.responses import FileResponse, StreamingResponse  # noqa: E402
 app = FastAPI(title="Dstill NovelAI Review")
 
 _PARAM_FIELDS = {f.name for f in dataclasses.fields(core.GenerationJobParams)}
+
+# 发起表单预设：存仓库 config/presets/*.json。绝不写密钥——保存时只保留
+# GenerationJobParams 字段（agent_api_key / novelai_token 不是其字段，天然被滤掉），
+# 再显式排除一次以防万一。
+_PRESETS_DIR = (_SCRIPTS.parent / "config" / "presets").resolve()
+_PRESET_NAME_RE = re.compile(r"^[\w\- 一-鿿]{1,64}$")
+_PRESET_SECRET_KEYS = {"agent_api_key", "novelai_token"}
+
+
+def _preset_path(name: str) -> Path:
+    name = (name or "").strip()
+    if not _PRESET_NAME_RE.fullmatch(name):
+        raise HTTPException(status_code=400, detail="预设名只能含字母/数字/中文/下划线/连字符/空格，且不超过 64 字")
+    path = (_PRESETS_DIR / f"{name}.json").resolve()
+    if path.parent != _PRESETS_DIR:
+        raise HTTPException(status_code=400, detail="bad preset name")
+    return path
 
 
 class _RunState:
@@ -78,6 +96,57 @@ def health() -> dict[str, Any]:
         "output_dir": str(STATE.output_dir) if STATE.output_dir else None,
         "token_present": bool(_token()),
     }
+
+
+@app.get("/options")
+def options() -> dict[str, Any]:
+    return {
+        "models": list(core.SUPPORTED_IMAGE_MODELS),
+        "samplers": list(core.SUPPORTED_SAMPLERS),
+        "resolution_presets": [p.name for p in core.BUILTIN_RESOLUTION_PRESETS],
+        "uc_presets": [1, 2, 3],  # 负面 preset 模式合法值（见 resolve_fixed_negative_prompt）
+    }
+
+
+@app.get("/presets")
+def list_presets() -> list[str]:
+    if not _PRESETS_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in _PRESETS_DIR.glob("*.json"))
+
+
+@app.get("/presets/{name}")
+def get_preset(name: str) -> dict[str, Any]:
+    path = _preset_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="preset not found")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"bad preset file: {exc}")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="bad preset file")
+    for key in _PRESET_SECRET_KEYS:
+        data.pop(key, None)
+    return data
+
+
+@app.put("/presets/{name}")
+def save_preset(name: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    path = _preset_path(name)
+    body = body or {}
+    data = {k: v for k, v in body.items() if k in _PARAM_FIELDS and k not in _PRESET_SECRET_KEYS}
+    _PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "name": path.stem}
+
+
+@app.delete("/presets/{name}")
+def delete_preset(name: str) -> dict[str, Any]:
+    path = _preset_path(name)
+    if path.is_file():
+        path.unlink()
+    return {"ok": True}
 
 
 @app.post("/run")
